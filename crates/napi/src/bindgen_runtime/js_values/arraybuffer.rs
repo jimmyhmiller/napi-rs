@@ -8,7 +8,7 @@ use std::sync::{
 };
 
 #[cfg(all(feature = "napi4", not(target_arch = "wasm32")))]
-use crate::bindgen_prelude::{CUSTOM_GC_TSFN, CUSTOM_GC_TSFN_CLOSED, THREADS_CAN_ACCESS_ENV};
+use crate::bindgen_prelude::route_custom_gc_unref;
 pub use crate::js_values::TypedArrayType;
 use crate::{check_status, sys, Error, Result, Status};
 
@@ -66,42 +66,28 @@ macro_rules! impl_typed_array {
       fn drop(&mut self) {
         if Arc::strong_count(&self.drop_in_vm) == 1 {
           if let Some((ref_, env)) = self.raw {
+            // The reference is bound to the isolate of the env it was created in.
+            // Route the release to that env's thread (its CustomGC
+            // ThreadsafeFunction) if we are not on it; release directly otherwise.
             #[cfg(all(feature = "napi4", not(target_arch = "wasm32")))]
             {
-              if CUSTOM_GC_TSFN_CLOSED
-                .with(|closed| closed.load(std::sync::atomic::Ordering::Relaxed))
-              {
-                return;
-              }
-              if !THREADS_CAN_ACCESS_ENV
-                .get_or_init(Default::default)
-                .contains(&std::thread::current().id())
-              {
-                let status = unsafe {
-                  sys::napi_call_threadsafe_function(
-                    CUSTOM_GC_TSFN.load(std::sync::atomic::Ordering::SeqCst),
-                    ref_.cast(),
-                    1,
-                  )
-                };
-                assert!(
-                  status == sys::Status::napi_ok,
-                  "Call custom GC in ArrayBuffer::drop failed {:?}",
-                  Status::from(status)
-                );
-                return;
-              }
+              route_custom_gc_unref(ref_, env);
             }
-            crate::check_status_or_throw!(
-              env,
-              unsafe { sys::napi_reference_unref(env, ref_, &mut 0) },
-              "Failed to unref ArrayBuffer reference in drop"
-            );
-            crate::check_status_or_throw!(
-              env,
-              unsafe { sys::napi_delete_reference(env, ref_) },
-              "Failed to delete ArrayBuffer reference in drop"
-            );
+            // Without `napi4` there is no CustomGC tsfn: release directly and
+            // assume we are on the owning env thread.
+            #[cfg(not(all(feature = "napi4", not(target_arch = "wasm32"))))]
+            {
+              crate::check_status_or_throw!(
+                env,
+                unsafe { sys::napi_reference_unref(env, ref_, &mut 0) },
+                "Failed to unref ArrayBuffer reference in drop"
+              );
+              crate::check_status_or_throw!(
+                env,
+                unsafe { sys::napi_delete_reference(env, ref_) },
+                "Failed to delete ArrayBuffer reference in drop"
+              );
+            }
             return;
           }
           if !self.drop_in_vm.load(Ordering::Acquire) {

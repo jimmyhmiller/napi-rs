@@ -1,9 +1,5 @@
 use std::collections::{HashMap, HashSet};
 use std::ffi::CStr;
-#[cfg(all(feature = "napi4", not(target_arch = "wasm32")))]
-use std::hash::Hash;
-#[cfg(all(feature = "napi4", not(target_arch = "wasm32")))]
-use std::ops::Deref;
 use std::ptr;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
@@ -77,45 +73,6 @@ impl<T> PersistedPerInstanceVec<T> {
 unsafe impl<T: Send> Send for PersistedPerInstanceVec<T> {}
 unsafe impl<T: Sync> Sync for PersistedPerInstanceVec<T> {}
 
-#[cfg(all(feature = "napi4", not(target_arch = "wasm32")))]
-pub(crate) struct PersistedPerInstanceHashSet<T: 'static> {
-  inner: *mut HashSet<T>,
-}
-
-#[cfg(all(feature = "napi4", not(target_arch = "wasm32")))]
-impl<T: 'static + PartialEq + Eq + Hash> PersistedPerInstanceHashSet<T> {
-  pub(crate) fn insert(&self, item: T) {
-    Box::leak(unsafe { Box::from_raw(self.inner) }).insert(item);
-  }
-
-  fn remove(&self, item: &T) {
-    Box::leak(unsafe { Box::from_raw(self.inner) }).remove(item);
-  }
-}
-
-#[cfg(all(feature = "napi4", not(target_arch = "wasm32")))]
-impl<T: 'static> Deref for PersistedPerInstanceHashSet<T> {
-  type Target = HashSet<T>;
-
-  fn deref(&self) -> &Self::Target {
-    Box::leak(unsafe { Box::from_raw(self.inner) })
-  }
-}
-
-#[cfg(all(feature = "napi4", not(target_arch = "wasm32")))]
-impl<T: 'static> Default for PersistedPerInstanceHashSet<T> {
-  fn default() -> Self {
-    Self {
-      inner: Box::leak(Box::default()),
-    }
-  }
-}
-
-#[cfg(all(feature = "napi4", not(target_arch = "wasm32")))]
-unsafe impl<T: Send> Send for PersistedPerInstanceHashSet<T> {}
-#[cfg(all(feature = "napi4", not(target_arch = "wasm32")))]
-unsafe impl<T: Sync> Sync for PersistedPerInstanceHashSet<T> {}
-
 pub(crate) struct PersistedPerInstanceHashMap<K, V>(*mut HashMap<K, V>);
 
 impl<K, V> PersistedPerInstanceHashMap<K, V> {
@@ -160,20 +117,93 @@ static IS_FIRST_MODULE: AtomicBool = AtomicBool::new(true);
 static FIRST_MODULE_REGISTERED: AtomicBool = AtomicBool::new(false);
 static REGISTERED_CLASSES: Lazy<RegisteredClassesMap> = Lazy::new(Default::default);
 static FN_REGISTER_MAP: Lazy<FnRegisterMap> = Lazy::new(Default::default);
+// Per-environment CustomGC registry.
+//
+// A `Buffer`/`TypedArray` received from JS carries a `napi_reference` bound to
+// the V8 isolate of the environment it was created in. That reference can only
+// be released on *that* environment's thread — V8 global handles are
+// isolate-bound, and touching one from another isolate's thread is a fatal error
+// (`Check failed: node->IsInUse()` in `GlobalHandles::MakeWeak`).
+//
+// When such a value is dropped on a non-owning thread (e.g. moved into an
+// `async fn` future on a tokio worker, or sent to another thread), its unref is
+// routed back to the owning environment's thread through that env's CustomGC
+// `ThreadsafeFunction`. Each environment (the main thread and every
+// `worker_thread`) registers its OWN tsfn here, keyed by its `napi_env` pointer.
+//
+// (Previously a single process-global tsfn was overwritten by every environment
+// that registered, so an off-thread unref of a worker's Buffer was routed to
+// whichever environment registered last — the wrong, or a torn-down, isolate.)
 #[cfg(all(feature = "napi4", not(target_arch = "wasm32")))]
-pub(crate) static CUSTOM_GC_TSFN: AtomicPtr<sys::napi_threadsafe_function__> =
-  AtomicPtr::new(ptr::null_mut());
+pub(crate) struct CustomGcTsfn(pub(crate) sys::napi_threadsafe_function);
+// SAFETY: a `napi_threadsafe_function` is explicitly designed to be invoked from
+// any thread (`napi_call_threadsafe_function`).
+#[cfg(all(feature = "napi4", not(target_arch = "wasm32")))]
+unsafe impl Send for CustomGcTsfn {}
+#[cfg(all(feature = "napi4", not(target_arch = "wasm32")))]
+unsafe impl Sync for CustomGcTsfn {}
+
+#[cfg(all(feature = "napi4", not(target_arch = "wasm32")))]
+pub(crate) static CUSTOM_GC_REGISTRY: Lazy<std::sync::RwLock<HashMap<usize, CustomGcTsfn>>> =
+  Lazy::new(Default::default);
+
 #[cfg(all(feature = "napi4", not(target_arch = "wasm32")))]
 thread_local! {
-  // CustomGC ThreadsafeFunction may be deleted during the process exit.
-  // And there may still some Buffer alive after that.
-  pub(crate) static CUSTOM_GC_TSFN_CLOSED: AtomicBool = AtomicBool::new(false);
+  // The `napi_env` of the environment this thread belongs to, set when the
+  // module registers on this thread. Null on non-env threads (tokio workers,
+  // user-spawned threads). Used to decide whether a Buffer/TypedArray reference
+  // can be released directly (we are on its owning env thread) or must be routed
+  // through that env's CustomGC tsfn.
+  pub(crate) static CURRENT_ENV: std::cell::Cell<sys::napi_env> =
+    std::cell::Cell::new(ptr::null_mut());
 }
+
+/// Release a `napi_reference` held by a dropping `Buffer`/`TypedArray`.
+///
+/// `env` is the environment the reference was created in. If we are on that
+/// environment's own thread the reference is released directly; otherwise the
+/// release is routed to the owning env's thread through its CustomGC tsfn so the
+/// release runs on the correct isolate.
 #[cfg(all(feature = "napi4", not(target_arch = "wasm32")))]
-// Store thread id of the thread that created the CustomGC ThreadsafeFunction.
-pub(crate) static THREADS_CAN_ACCESS_ENV: once_cell::sync::OnceCell<
-  PersistedPerInstanceHashSet<ThreadId>,
-> = once_cell::sync::OnceCell::new();
+pub(crate) fn route_custom_gc_unref(ref_: sys::napi_ref, env: sys::napi_env) {
+  if ref_.is_null() || env.is_null() {
+    return;
+  }
+  // On the owning environment's own thread: release directly. Best-effort —
+  // a dropping value must never throw, and these can fail during env teardown.
+  if CURRENT_ENV.with(|cell| cell.get()) == env {
+    let mut ref_count = 0;
+    let status = unsafe { sys::napi_reference_unref(env, ref_, &mut ref_count) };
+    debug_assert!(
+      status != sys::Status::napi_ok || ref_count == 0,
+      "Buffer reference count in drop is not zero"
+    );
+    unsafe { sys::napi_delete_reference(env, ref_) };
+    return;
+  }
+  // Off the owning thread: route the release to the owning env's CustomGC tsfn so
+  // it runs on the correct isolate. Holding the read lock across the call keeps
+  // the tsfn alive against concurrent env teardown — `custom_gc_finalize` takes
+  // the write lock (so node cannot free the tsfn) until the call returns.
+  let registry = CUSTOM_GC_REGISTRY
+    .read()
+    .unwrap_or_else(|poisoned| poisoned.into_inner());
+  if let Some(tsfn) = registry.get(&(env as usize)) {
+    let status = unsafe { sys::napi_call_threadsafe_function(tsfn.0, ref_.cast(), 1) };
+    // `napi_closing`/`napi_invalid_arg` mean the owning env is tearing down: its
+    // references die with the isolate, so the release is moot.
+    debug_assert!(
+      matches!(
+        status,
+        sys::Status::napi_ok | sys::Status::napi_closing | sys::Status::napi_invalid_arg
+      ),
+      "Call custom GC failed {:?}",
+      crate::Status::from(status)
+    );
+  }
+  // If absent, the owning environment has been torn down; its references were
+  // already freed with the isolate, so there is nothing to release.
+}
 
 type RegisteredClasses =
   PersistedPerInstanceHashMap</* export name */ String, /* constructor */ sys::napi_ref>;
@@ -626,29 +656,13 @@ fn create_custom_gc(env: sys::napi_env) {
     unsafe { sys::napi_unref_threadsafe_function(env, custom_gc_tsfn) },
     "Unref Custom GC ThreadsafeFunction in napi_register_module_v1 failed"
   );
-  CUSTOM_GC_TSFN.store(custom_gc_tsfn, Ordering::Relaxed);
-  let threads = THREADS_CAN_ACCESS_ENV.get_or_init(Default::default);
-  let current_thread_id = std::thread::current().id();
-  threads.insert(current_thread_id);
-  check_status_or_throw!(
-    env,
-    unsafe {
-      sys::napi_add_env_cleanup_hook(
-        env,
-        Some(remove_thread_id),
-        Box::into_raw(Box::new(current_thread_id)).cast(),
-      )
-    },
-    "Failed to add remove thread id cleanup hook"
-  );
-}
-
-#[cfg(all(feature = "napi4", not(target_arch = "wasm32")))]
-unsafe extern "C" fn remove_thread_id(id: *mut std::ffi::c_void) {
-  let thread_id = unsafe { Box::from_raw(id.cast::<ThreadId>()) };
-  THREADS_CAN_ACCESS_ENV
-    .get_or_init(Default::default)
-    .remove(&*thread_id);
+  // Register this environment's tsfn keyed by `env`, and remember which env this
+  // thread belongs to so off-thread drops can be routed back to it.
+  CUSTOM_GC_REGISTRY
+    .write()
+    .unwrap_or_else(|poisoned| poisoned.into_inner())
+    .insert(env as usize, CustomGcTsfn(custom_gc_tsfn));
+  CURRENT_ENV.with(|cell| cell.set(env));
 }
 
 #[cfg(all(feature = "napi4", not(target_arch = "wasm32")))]
@@ -664,9 +678,14 @@ unsafe extern "C" fn custom_gc_finalize(
   finalize_data: *mut std::ffi::c_void,
   finalize_hint: *mut std::ffi::c_void,
 ) {
-  CUSTOM_GC_TSFN_CLOSED.with(|closed| {
-    closed.store(true, Ordering::Relaxed);
-  });
+  // This environment is being torn down; remove its tsfn from the registry so no
+  // further off-thread release is routed to a dead isolate. The write lock
+  // serializes against `route_custom_gc_unref` (holding the read lock while
+  // calling the tsfn), so the tsfn is never freed mid-call.
+  CUSTOM_GC_REGISTRY
+    .write()
+    .unwrap_or_else(|poisoned| poisoned.into_inner())
+    .remove(&(env as usize));
 }
 
 #[cfg(all(feature = "napi4", not(target_arch = "wasm32")))]
@@ -677,9 +696,10 @@ extern "C" fn custom_gc(
   _context: *mut std::ffi::c_void,
   data: *mut std::ffi::c_void,
 ) {
-  check_status_or_throw!(
-    env,
-    unsafe { sys::napi_delete_reference(env, data as sys::napi_ref) },
-    "Failed to delete Buffer reference in Custom GC"
-  );
+  if data.is_null() {
+    return;
+  }
+  // Runs on the owning environment's own thread (this tsfn belongs to `env`).
+  // Best-effort: never throw from here.
+  unsafe { sys::napi_delete_reference(env, data as sys::napi_ref) };
 }
