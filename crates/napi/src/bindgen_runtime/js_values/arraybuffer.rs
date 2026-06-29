@@ -3,11 +3,9 @@ use std::marker::PhantomData;
 use std::mem;
 use std::ops::Deref;
 use std::ptr::{self, NonNull};
-#[cfg(all(feature = "napi4", not(feature = "noop")))]
-use std::sync::atomic::Ordering;
 
 #[cfg(all(feature = "napi4", not(feature = "noop")))]
-use crate::bindgen_prelude::{CUSTOM_GC_TSFN, CUSTOM_GC_TSFN_DESTROYED, THREADS_CAN_ACCESS_ENV};
+use crate::bindgen_prelude::route_custom_gc_unref;
 use crate::{
   bindgen_prelude::{
     FromNapiValue, JsObjectValue, JsValue, This, ToNapiValue, TypeName, ValidateNapiValue,
@@ -486,42 +484,33 @@ macro_rules! impl_typed_array {
           if ref_.is_null() || env.is_null() {
             return;
           }
+          // The reference is bound to the isolate of the env it was created in.
+          // Route the unref to that env's thread (its CustomGC ThreadsafeFunction)
+          // if we are not on it; release directly otherwise.
           #[cfg(all(feature = "napi4", not(feature = "noop")))]
           {
-            if CUSTOM_GC_TSFN_DESTROYED.load(Ordering::SeqCst) {
-              return;
-            }
-            if !THREADS_CAN_ACCESS_ENV.with(|cell| cell.get()) {
-              let status = unsafe {
-                sys::napi_call_threadsafe_function(
-                  CUSTOM_GC_TSFN.load(std::sync::atomic::Ordering::SeqCst),
-                  ref_.cast(),
-                  1,
-                )
-              };
-              assert!(
-                status == sys::Status::napi_ok || status == sys::Status::napi_closing,
-                "Call custom GC in ArrayBuffer::drop failed {}",
-                Status::from(status)
-              );
-              return;
-            }
+            route_custom_gc_unref(ref_, env);
           }
-          let mut ref_count = 0;
-          crate::check_status_or_throw!(
-            env,
-            unsafe { sys::napi_reference_unref(env, ref_, &mut ref_count) },
-            "Failed to unref ArrayBuffer reference in drop"
-          );
-          debug_assert!(
-            ref_count == 0,
-            "ArrayBuffer reference count in ArrayBuffer::drop is not zero"
-          );
-          crate::check_status_or_throw!(
-            env,
-            unsafe { sys::napi_delete_reference(env, ref_) },
-            "Failed to delete ArrayBuffer reference in drop"
-          );
+          // Without `napi4` there is no CustomGC tsfn: release directly and assume
+          // we are on the owning env thread.
+          #[cfg(not(all(feature = "napi4", not(feature = "noop"))))]
+          {
+            let mut ref_count = 0;
+            crate::check_status_or_throw!(
+              env,
+              unsafe { sys::napi_reference_unref(env, ref_, &mut ref_count) },
+              "Failed to unref ArrayBuffer reference in drop"
+            );
+            debug_assert!(
+              ref_count == 0,
+              "ArrayBuffer reference count in ArrayBuffer::drop is not zero"
+            );
+            crate::check_status_or_throw!(
+              env,
+              unsafe { sys::napi_delete_reference(env, ref_) },
+              "Failed to delete ArrayBuffer reference in drop"
+            );
+          }
           return;
         }
         // If the `finalizer_notify` is not null, it means the data is external, and we call the finalizer instead of the `Vec::from_raw_parts`

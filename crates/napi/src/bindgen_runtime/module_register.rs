@@ -129,15 +129,110 @@ static ENV_CLEANUP_HOOK_ADDED: RwLock<bool> = RwLock::new(false);
 thread_local! {
   static REGISTERED_CLASSES: LazyCell<RegisteredClasses> = LazyCell::new(Default::default);
 }
+// Per-environment CustomGC registry.
+//
+// A `Buffer`/`TypedArray` received from JS carries a `napi_reference` that is
+// bound to the V8 isolate of the environment it was created in. That reference
+// can only be released on *that* environment's thread — V8 global handles are
+// isolate-bound, and touching one from another isolate's thread is a fatal
+// error (`Check failed: node->IsInUse()` in `GlobalHandles::MakeWeak`).
+//
+// When such a value is dropped on a non-owning thread (e.g. it was moved into an
+// `async fn` future running on a tokio worker, or sent to another thread), we
+// route its unref back to the owning environment's thread through a CustomGC
+// `ThreadsafeFunction`. Each environment (the main thread and every
+// `worker_thread`) registers its OWN tsfn here, keyed by its `napi_env` pointer,
+// so the unref always lands on the correct isolate.
+//
+// (Previously a single process-global tsfn was shared by all environments, so an
+// off-thread unref of a worker's Buffer was routed to whichever environment
+// loaded the addon first — the wrong, or an already-torn-down, isolate.)
 #[cfg(all(feature = "napi4", not(feature = "noop")))]
-pub(crate) static CUSTOM_GC_TSFN: std::sync::atomic::AtomicPtr<sys::napi_threadsafe_function__> =
-  std::sync::atomic::AtomicPtr::new(ptr::null_mut());
+pub(crate) struct CustomGcTsfn(pub(crate) sys::napi_threadsafe_function);
+// SAFETY: a `napi_threadsafe_function` is explicitly designed to be invoked from
+// any thread (`napi_call_threadsafe_function`).
 #[cfg(all(feature = "napi4", not(feature = "noop")))]
-pub(crate) static CUSTOM_GC_TSFN_DESTROYED: AtomicBool = AtomicBool::new(false);
+unsafe impl Send for CustomGcTsfn {}
+#[cfg(all(feature = "napi4", not(feature = "noop")))]
+unsafe impl Sync for CustomGcTsfn {}
+
+#[cfg(all(feature = "napi4", not(feature = "noop")))]
+pub(crate) static CUSTOM_GC_REGISTRY: LazyLock<RwLock<HashMap<usize, CustomGcTsfn>>> =
+  LazyLock::new(|| RwLock::new(HashMap::default()));
+
 thread_local! {
   #[cfg(all(feature = "napi4", not(feature = "noop")))]
-  // Store thread id of the thread that created the CustomGC ThreadsafeFunction.
+  // The `napi_env` of the environment this thread belongs to, set when the
+  // module registers on this thread. Null on non-env threads (tokio workers,
+  // user-spawned threads). Used to decide whether a Buffer/TypedArray reference
+  // can be released directly (we are on its owning env thread) or must be routed
+  // through that env's CustomGC tsfn.
+  pub(crate) static CURRENT_ENV: Cell<sys::napi_env> = const { Cell::new(ptr::null_mut()) };
+  #[cfg(all(feature = "napi4", not(feature = "noop")))]
+  // Whether the current thread is an environment thread that can touch napi
+  // references at all. Used to guard the CustomGC callback.
   pub(crate) static THREADS_CAN_ACCESS_ENV: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Release a `napi_reference` held by a dropping `Buffer`/`TypedArray`.
+///
+/// `env` is the environment the reference was created in. If we are on that
+/// environment's own thread the reference is released directly; otherwise the
+/// release is routed to the owning env's thread through its CustomGC tsfn so the
+/// `napi_reference_unref` runs on the correct isolate.
+#[cfg(all(feature = "napi4", not(feature = "noop")))]
+pub(crate) fn route_custom_gc_unref(ref_: sys::napi_ref, env: sys::napi_env) {
+  if ref_.is_null() || env.is_null() {
+    return;
+  }
+  // On the owning environment's own thread: release directly.
+  if CURRENT_ENV.with(|cell| cell.get()) == env {
+    unsafe { release_buffer_ref(env, ref_) };
+    return;
+  }
+  // Off the owning thread: route the unref to the owning env's CustomGC tsfn so
+  // it runs on the correct isolate. Holding the read lock across the call keeps
+  // the tsfn alive against concurrent env teardown — `custom_gc_finalize` takes
+  // the write lock (so node cannot free the tsfn) until the call returns.
+  let registry = CUSTOM_GC_REGISTRY
+    .read()
+    .unwrap_or_else(|poisoned| poisoned.into_inner());
+  if let Some(tsfn) = registry.get(&(env as usize)) {
+    let status = unsafe {
+      sys::napi_call_threadsafe_function(
+        tsfn.0,
+        ref_.cast(),
+        sys::ThreadsafeFunctionCallMode::blocking,
+      )
+    };
+    // `napi_closing`/`napi_invalid_arg` mean the owning env is tearing down: its
+    // references die with the isolate, so the unref is moot. Anything else is
+    // unexpected and worth catching in debug builds.
+    debug_assert!(
+      matches!(
+        status,
+        sys::Status::napi_ok | sys::Status::napi_closing | sys::Status::napi_invalid_arg
+      ),
+      "Call custom GC failed {}",
+      crate::Status::from(status)
+    );
+  }
+  // If absent, the owning environment has been torn down; its references were
+  // already freed with the isolate, so there is nothing to release.
+}
+
+/// Release a buffer/typedarray `napi_reference` on its owning environment's
+/// thread. Best-effort: a dropping value must never throw, and during env
+/// teardown these calls can fail (the isolate frees the handle regardless).
+#[cfg(all(feature = "napi4", not(feature = "noop")))]
+unsafe fn release_buffer_ref(env: sys::napi_env, ref_: sys::napi_ref) {
+  let mut ref_count = 0;
+  let status = unsafe { sys::napi_reference_unref(env, ref_, &mut ref_count) };
+  debug_assert!(
+    status != sys::Status::napi_ok || ref_count == 0,
+    "Buffer reference count in drop is not zero"
+  );
+  unsafe { sys::napi_delete_reference(env, ref_) };
 }
 
 type RegisteredClasses = PersistedPerInstanceHashMap<
@@ -564,58 +659,62 @@ pub(crate) unsafe extern "C" fn noop(
 
 #[cfg(all(feature = "napi4", not(feature = "noop")))]
 fn create_custom_gc(env: sys::napi_env) {
-  if !FIRST_MODULE_REGISTERED.load(Ordering::SeqCst) {
-    let mut custom_gc_fn = ptr::null_mut();
-    check_status_or_throw!(
-      env,
-      unsafe {
-        sys::napi_create_function(
-          env,
-          c"custom_gc".as_ptr(),
-          9,
-          Some(empty),
-          ptr::null_mut(),
-          &mut custom_gc_fn,
-        )
-      },
-      "Create Custom GC Function in napi_register_module_v1 failed"
-    );
-    let mut async_resource_name = ptr::null_mut();
-    check_status_or_throw!(
-      env,
-      unsafe {
-        sys::napi_create_string_utf8(env, c"CustomGC".as_ptr(), 8, &mut async_resource_name)
-      },
-      "Create async resource string in napi_register_module_v1"
-    );
-    let mut custom_gc_tsfn = ptr::null_mut();
-    check_status_or_throw!(
-      env,
-      unsafe {
-        sys::napi_create_threadsafe_function(
-          env,
-          custom_gc_fn,
-          ptr::null_mut(),
-          async_resource_name,
-          0,
-          1,
-          ptr::null_mut(),
-          Some(custom_gc_finalize),
-          ptr::null_mut(),
-          Some(custom_gc),
-          &mut custom_gc_tsfn,
-        )
-      },
-      "Create Custom GC ThreadsafeFunction in napi_register_module_v1 failed"
-    );
-    check_status_or_throw!(
-      env,
-      unsafe { sys::napi_unref_threadsafe_function(env, custom_gc_tsfn) },
-      "Unref Custom GC ThreadsafeFunction in napi_register_module_v1 failed"
-    );
-    CUSTOM_GC_TSFN.store(custom_gc_tsfn, Ordering::Relaxed);
-  }
+  // Create a CustomGC ThreadsafeFunction *per environment* (main thread and each
+  // worker_thread), keyed by `env` in `CUSTOM_GC_REGISTRY`. Off-thread Buffer /
+  // TypedArray unrefs are routed back to their owning env's tsfn so the
+  // `napi_reference_unref` always runs on the correct isolate.
+  let mut custom_gc_fn = ptr::null_mut();
+  check_status_or_throw!(
+    env,
+    unsafe {
+      sys::napi_create_function(
+        env,
+        c"custom_gc".as_ptr(),
+        9,
+        Some(empty),
+        ptr::null_mut(),
+        &mut custom_gc_fn,
+      )
+    },
+    "Create Custom GC Function in napi_register_module_v1 failed"
+  );
+  let mut async_resource_name = ptr::null_mut();
+  check_status_or_throw!(
+    env,
+    unsafe { sys::napi_create_string_utf8(env, c"CustomGC".as_ptr(), 8, &mut async_resource_name) },
+    "Create async resource string in napi_register_module_v1"
+  );
+  let mut custom_gc_tsfn = ptr::null_mut();
+  check_status_or_throw!(
+    env,
+    unsafe {
+      sys::napi_create_threadsafe_function(
+        env,
+        custom_gc_fn,
+        ptr::null_mut(),
+        async_resource_name,
+        0,
+        1,
+        ptr::null_mut(),
+        Some(custom_gc_finalize),
+        ptr::null_mut(),
+        Some(custom_gc),
+        &mut custom_gc_tsfn,
+      )
+    },
+    "Create Custom GC ThreadsafeFunction in napi_register_module_v1 failed"
+  );
+  check_status_or_throw!(
+    env,
+    unsafe { sys::napi_unref_threadsafe_function(env, custom_gc_tsfn) },
+    "Unref Custom GC ThreadsafeFunction in napi_register_module_v1 failed"
+  );
+  CUSTOM_GC_REGISTRY
+    .write()
+    .unwrap_or_else(|poisoned| poisoned.into_inner())
+    .insert(env as usize, CustomGcTsfn(custom_gc_tsfn));
 
+  CURRENT_ENV.with(|cell| cell.set(env));
   THREADS_CAN_ACCESS_ENV.with(|cell| cell.set(true));
 }
 
@@ -658,7 +757,14 @@ unsafe extern "C" fn custom_gc_finalize(
   finalize_data: *mut std::ffi::c_void,
   finalize_hint: *mut std::ffi::c_void,
 ) {
-  CUSTOM_GC_TSFN_DESTROYED.store(true, Ordering::SeqCst);
+  // This environment is being torn down; remove its tsfn from the registry so no
+  // further off-thread unref is routed to a dead isolate. Taking the write lock
+  // here serializes against `route_custom_gc_unref` (which holds the read lock
+  // while calling the tsfn), so the tsfn is never freed mid-call.
+  CUSTOM_GC_REGISTRY
+    .write()
+    .unwrap_or_else(|poisoned| poisoned.into_inner())
+    .remove(&(env as usize));
 }
 
 #[cfg(all(feature = "napi4", not(feature = "noop")))]
@@ -673,19 +779,8 @@ extern "C" fn custom_gc(
   if THREADS_CAN_ACCESS_ENV.with(|cell| !cell.get()) || data.is_null() {
     return;
   }
-  let mut ref_count = 0;
-  check_status_or_throw!(
-    env,
-    unsafe { sys::napi_reference_unref(env, data.cast(), &mut ref_count) },
-    "Failed to unref Buffer reference in Custom GC"
-  );
-  debug_assert!(
-    ref_count == 0,
-    "Buffer reference count in Custom GC is not 0"
-  );
-  check_status_or_throw!(
-    env,
-    unsafe { sys::napi_delete_reference(env, data.cast()) },
-    "Failed to delete Buffer reference in Custom GC"
-  );
+  // Runs on the owning environment's own thread (this tsfn belongs to `env`), so
+  // the unref always targets the correct isolate. Best-effort: never throw from
+  // here.
+  unsafe { release_buffer_ref(env, data.cast()) };
 }
